@@ -6,7 +6,7 @@ import unittest
 import _path  # noqa: F401
 import httpx
 
-from quant_ripper.http_client import HttpClientError, HttpJsonClient
+from quant_ripper.infrastructure.http_client import HttpClientError, HttpJsonClient
 
 
 class HttpJsonClientTests(unittest.TestCase):

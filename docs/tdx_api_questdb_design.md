@@ -681,3 +681,22 @@ flowchart LR
 - 明确 `minute_trend` 和分钟 K 线的区别。
 - 价格字段名保持业务语义，单位统一在文档中声明为“厘”。
 - 数量字段统一在文档中声明为“股”。
+
+## 11. 工程实现补充
+
+当前实现已按业务分层拆分，详细架构、模块职责和完整架构图见：
+
+- `docs/architecture.md`
+- `docs/architecture.drawio`
+
+部署到 Prefect Server 的打包、虚拟环境、Docker、work pool、worker 和 deployment 操作步骤见：
+
+- `docs/prefect_deployment.md`
+
+实现约束：
+
+- Redis 连接统一使用 `redis-py`。
+- HTTP 调用统一使用 `httpx`。
+- QuestDB 行情写入统一使用 `questdb.ingress.Sender`。
+- DDL、DELETE、校验查询优先使用 PGWire，必要时通过 `httpx` 调用 QuestDB `/exec`。
+- 应用层、领域层、基础设施层的方法均保留 docstring，解释职责与关键业务约束。

@@ -4,10 +4,10 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
-from urllib.request import urlopen
 
-from .config import Settings
+import httpx
+
+from ..core.config import Settings
 from .http_client import HttpClientError
 
 
@@ -66,6 +66,7 @@ TIMESTAMP_COLUMNS: dict[str, str] = {
 
 
 def split_sql(sql: str) -> list[str]:
+    """拆分 SQL 脚本；保留字符串和注释中的分号，不误切语句。"""
     statements: list[str] = []
     current: list[str] = []
     in_single = False
@@ -75,6 +76,7 @@ def split_sql(sql: str) -> list[str]:
         ch = sql[i]
         nxt = sql[i + 1] if i + 1 < len(sql) else ""
         if not in_single and not in_double and ch == "-" and nxt == "-":
+            # 行注释中的分号不能作为 SQL 结束符。
             while i < len(sql) and sql[i] not in "\r\n":
                 current.append(sql[i])
                 i += 1
@@ -98,10 +100,14 @@ def split_sql(sql: str) -> list[str]:
 
 
 class QuestSqlClient:
+    """QuestDB SQL 客户端，负责 DDL、DELETE 覆盖写入和运维查询。"""
+
     def __init__(self, settings: Settings):
+        """保存连接配置；执行时优先 PGWire，缺少 psycopg 时可退到 HTTP /exec。"""
         self.settings = settings
 
     def execute_file(self, path: Path) -> int:
+        """执行 SQL 文件中的所有语句，返回实际执行的语句数量。"""
         sql = path.read_text(encoding="utf-8")
         statements = split_sql(sql)
         for statement in statements:
@@ -109,16 +115,19 @@ class QuestSqlClient:
         return len(statements)
 
     def execute(self, sql: str) -> Any:
+        """执行单条 SQL；DDL/DELETE/checkpoint 查询都走这个入口。"""
         try:
             import psycopg  # type: ignore
         except ImportError as exc:
             if self.settings.pgwire_required:
                 raise RuntimeError("psycopg is required for PGWire. Install with: python -m pip install .[pgwire]") from exc
+            # Prefect/Docker 轻量环境没有 psycopg 时，使用 QuestDB HTTP /exec 兜底。
             logger.warning("pgwire_unavailable_using_http_exec")
             return self._execute_http(sql)
         return self._execute_pgwire(sql, psycopg)
 
     def _execute_pgwire(self, sql: str, psycopg: Any) -> Any:
+        """通过 psycopg 连接 QuestDB PGWire 执行 SQL。"""
         conninfo = (
             f"host={self.settings.questdb_pg_host} "
             f"port={self.settings.questdb_pg_port} "
@@ -134,16 +143,17 @@ class QuestSqlClient:
         return None
 
     def _execute_http(self, sql: str) -> Any:
-        query = urlencode({"query": sql})
-        url = f"{self.settings.questdb_http_url}/exec?{query}"
+        """通过 httpx 调用 QuestDB HTTP `/exec` 执行 SQL。"""
         try:
-            with urlopen(url, timeout=self.settings.http_timeout_seconds) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body) if body else None
-        except Exception as exc:
+            with httpx.Client(base_url=self.settings.questdb_http_url, timeout=self.settings.http_timeout_seconds) as client:
+                response = client.get("/exec", params={"query": sql})
+                response.raise_for_status()
+                return json.loads(response.text) if response.text else None
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
             raise HttpClientError(f"QuestDB HTTP exec failed: {exc}") from exc
 
     def delete_trade_day(self, code: str, trade_date: str, source: str = "tdx") -> None:
+        """删除某来源、代码、交易日的全部成交明细，为全日覆盖写入做准备。"""
         self.execute(
             "DELETE FROM trade_print "
             f"WHERE source = '{_sql_literal(source)}' "
@@ -152,6 +162,7 @@ class QuestSqlClient:
         )
 
     def delete_trade_minute(self, code: str, trade_date: str, ts_iso: str, source: str = "tdx") -> None:
+        """删除某一分钟桶成交明细，适用于盘中局部刷新后重插。"""
         self.execute(
             "DELETE FROM trade_print "
             f"WHERE source = '{_sql_literal(source)}' "
@@ -162,4 +173,5 @@ class QuestSqlClient:
 
 
 def _sql_literal(value: str) -> str:
+    """转义 SQL 字符串字面量中的单引号，避免 DELETE 条件拼接错误。"""
     return value.replace("'", "''")

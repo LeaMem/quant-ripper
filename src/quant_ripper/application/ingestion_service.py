@@ -6,14 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import PROJECT_ROOT, Settings
-from .http_client import HttpJsonClient
-from .ilp import QuestIlpWriter
-from .questdb import SYMBOL_COLUMNS, TIMESTAMP_COLUMNS, QuestSqlClient
-from .redis_client import MinimalRedis
-from .tdx import TdxClient, extract_list, unwrap_payload
-from .time_utils import minute_key, now_cn, parse_datetime, yyyymmdd
-from .transform import (
+from ..common.time_utils import minute_key, now_cn, parse_datetime, yyyymmdd
+from ..core.config import PROJECT_ROOT, Settings
+from ..domain.transforms import (
     INTRADAY_TYPES,
     day_start,
     infer_asset_type,
@@ -25,13 +20,21 @@ from .transform import (
     orderbook_feature,
     snapshot_from_instrument,
 )
+from ..infrastructure.http_client import HttpJsonClient
+from ..infrastructure.questdb_client import SYMBOL_COLUMNS, TIMESTAMP_COLUMNS, QuestSqlClient
+from ..infrastructure.questdb_ilp import QuestDbIlpWriter
+from ..infrastructure.redis_cache import RedisQuoteCache
+from ..infrastructure.tdx_client import TdxClient, extract_list, unwrap_payload
 
 
 logger = logging.getLogger(__name__)
 
 
 class MarketIngestionService:
+    """行情采集应用服务，串联 TDX 拉取、领域标准化、Redis 缓存和 QuestDB 写入。"""
+
     def __init__(self, settings: Settings):
+        """根据运行配置创建外部系统客户端；实例方法会产生网络和写库副作用。"""
         self.settings = settings
         self.tdx = TdxClient(
             HttpJsonClient(
@@ -42,8 +45,8 @@ class MarketIngestionService:
             )
         )
         self.sql = QuestSqlClient(settings)
-        self.ilp = QuestIlpWriter(settings.questdb_ilp_host, settings.questdb_ilp_port, settings.http_timeout_seconds)
-        self.redis = MinimalRedis(
+        self.ilp = QuestDbIlpWriter.from_settings(settings)
+        self.redis = RedisQuoteCache(
             settings.redis_host,
             settings.redis_port,
             settings.redis_db,
@@ -52,12 +55,14 @@ class MarketIngestionService:
         )
 
     def init_schema(self, schema_path: Path | None = None) -> int:
+        """执行 QuestDB schema SQL，创建/更新行情事实表、日志表和 checkpoint 表。"""
         path = schema_path or PROJECT_ROOT / "sql" / "questdb_schema.sql"
         count = self.sql.execute_file(path)
         logger.info("schema_initialized", extra={"statement_count": count, "schema_path": str(path)})
         return count
 
     def health(self) -> dict[str, Any]:
+        """检查 TDX、QuestDB SQL、Redis 连通性；只返回状态，不写事实表。"""
         result: dict[str, Any] = {}
         try:
             tdx = self.tdx.health()
@@ -76,6 +81,7 @@ class MarketIngestionService:
         return result
 
     def collect_instruments(self, exchange: str | None = None, include_etf: bool = True) -> int:
+        """采集股票/ETF 主数据，同时写当前主表和日快照表。"""
         collected_at = now_cn()
         rows: list[dict[str, Any]] = []
         stock_result = self.tdx.codes(exchange=exchange)
@@ -89,6 +95,7 @@ class MarketIngestionService:
                 rows.extend(normalize_instrument({"code": item} if isinstance(item, str) else item, collected_at, self.settings.source, "etf") for item in etfs)
                 self.log_ingestion("/api/etf-codes", "all", "success" if etfs else "empty", etf_result.latency_ms, len(etfs))
             except Exception as exc:
+                # ETF 主数据失败不阻断股票主数据落库，但会写采集日志方便补跑。
                 self.log_ingestion("/api/etf-codes", "all", "failed", 0, 0, str(exc))
                 logger.warning("collect_etf_failed", extra={"error": str(exc)})
         rows = [row for row in rows if row.get("code")]
@@ -100,6 +107,7 @@ class MarketIngestionService:
         return len(rows)
 
     def collect_calendar(self, start: str, end: str) -> int:
+        """采集交易日历闭区间并写入 trading_calendar 表。"""
         result = self.tdx.workday_range(start, end)
         items = extract_list(result.data)
         rows = []
@@ -118,6 +126,7 @@ class MarketIngestionService:
         return len(rows)
 
     def collect_quotes(self, codes: list[str]) -> tuple[int, int]:
+        """采集一批 1 分钟盘口，写快照表和对应盘口特征表。"""
         result = self.tdx.batch_quote(codes)
         items = extract_list(result.data)
         collected_at = now_cn()
@@ -129,18 +138,21 @@ class MarketIngestionService:
         return len(quotes), len(features)
 
     def sample_watchlist(self, codes: list[str]) -> int:
+        """采样自选池盘口并写入 Redis 分钟窗口，等待分钟结束后聚合。"""
         result = self.tdx.batch_quote(codes)
         items = extract_list(result.data)
         collected_at = now_cn()
         rows = [normalize_quote(item, collected_at, self.settings.source, self.settings.price_scale) for item in items if isinstance(item, dict)]
         for row in rows:
             key = self.redis_key(row["code"], minute_key(row["ts"]))
+            # 同一分钟内保留多个样本，flush 时取最后一笔快照并聚合盘口特征。
             self.redis.rpush(key, json.dumps(row, ensure_ascii=False, default=_json_default))
             self.redis.expire(key, self.settings.quote_redis_ttl_seconds)
         self.log_ingestion("/api/batch-quote", f"watchlist={len(codes)}", "success" if rows else "empty", result.latency_ms, len(rows))
         return len(rows)
 
     def flush_watchlist(self, minute: str | None = None, codes: list[str] | None = None, delete_keys: bool = True) -> tuple[int, int]:
+        """聚合 Redis 自选池样本，写入 1 分钟快照/特征并可删除已处理 key。"""
         if minute and codes:
             keys = [self.redis_key(code, minute) for code in codes]
         elif minute:
@@ -157,6 +169,7 @@ class MarketIngestionService:
             if not samples:
                 continue
             samples = sorted(samples, key=lambda row: row["collected_at"] or row["ts"])
+            # 快照取分钟内最后一笔；特征使用该分钟内全部有效样本。
             quotes.append(samples[-1])
             features.append(orderbook_feature(samples))
             flushed_keys.append(key)
@@ -167,14 +180,17 @@ class MarketIngestionService:
         return len(quotes), len(features)
 
     def collect_kline(self, codes: list[str], bar_type: str, adjustment: str = "raw", source: str = "tdx", limit: int | None = None) -> int:
+        """按 source/adjustment 策略采集 K 线，写入日内或日终 bar 表。"""
         table = "bar_intraday" if bar_type in INTRADAY_TYPES else "bar_eod"
         total = 0
         for code in codes:
             if source == "ths" or adjustment == "qfq":
+                # 前复权主链路显式使用 THS endpoint，避免 raw/qfq 静默混用。
                 result = self.tdx.kline_all_ths(code, bar_type, limit)
                 endpoint = "/api/kline-all/ths"
                 row_source = "ths"
             elif infer_asset_type(code) == "index":
+                # 指数使用独立 endpoint；行内 source 仍按项目默认数据源写入。
                 result = self.tdx.index_all(code, bar_type, limit)
                 endpoint = "/api/index/all"
                 row_source = self.settings.source
@@ -198,6 +214,7 @@ class MarketIngestionService:
         return total
 
     def collect_minute(self, codes: list[str], trade_date: str) -> int:
+        """采集分时走势；如果 API 回退到其他日期，则在日志中标记 fallback_detected。"""
         total = 0
         for code in codes:
             result = self.tdx.minute(code, trade_date)
@@ -219,6 +236,7 @@ class MarketIngestionService:
         return total
 
     def collect_trades(self, codes: list[str], trade_date: str) -> int:
+        """采集单日成交明细，先删交易日桶再整批写入以保证重复执行幂等。"""
         total = 0
         for code in codes:
             result = self.tdx.minute_trade_all(code, trade_date)
@@ -230,6 +248,7 @@ class MarketIngestionService:
             ]
             rows = [row for row in rows if row["ts"] is not None]
             rows.sort(key=lambda row: row["ts"])
+            # trade_print 没有可靠逐笔唯一键，按设计采用 DELETE + INSERT 覆盖语义。
             self.sql.delete_trade_day(code, trade_date, self.settings.source)
             self.write_table("trade_print", rows)
             self.log_ingestion("/api/minute-trade-all", f"code={code},date={trade_date}", "success" if rows else "empty", result.latency_ms, len(rows))
@@ -237,6 +256,7 @@ class MarketIngestionService:
         return total
 
     def write_table(self, table: str, rows: list[dict[str, Any]]) -> int:
+        """通过 QuestDB 官方 ILP client 写入标准化行；空批次直接跳过。"""
         if not rows:
             return 0
         written = self.ilp.write_rows(table, rows, TIMESTAMP_COLUMNS[table], SYMBOL_COLUMNS[table])
@@ -244,6 +264,7 @@ class MarketIngestionService:
         return written
 
     def log_ingestion(self, endpoint: str, request_key: str, status: str, latency_ms: int, row_count: int, error: str = "") -> None:
+        """写采集日志；日志写入失败只记录异常，不反向中断主采集链路。"""
         row = {
             "ts": now_cn(),
             "source": self.settings.source,
@@ -271,6 +292,7 @@ class MarketIngestionService:
         last_success_trade_date: str,
         status: str,
     ) -> None:
+        """更新采集断点，记录代码/周期/复权口径最近成功位置。"""
         row = {
             "ts": now_cn(),
             "source": self.settings.source,
@@ -287,16 +309,19 @@ class MarketIngestionService:
         self.write_table("ingestion_checkpoint", [row])
 
     def redis_key(self, code: str, minute: str) -> str:
+        """生成自选池分钟窗口 key：`quote:{source}:{code}:{yyyyMMddHHmm}`。"""
         return f"{self.settings.redis_key_prefix}:{self.settings.source}:{code}:{minute}"
 
 
 def _json_default(value: Any) -> str:
+    """把 datetime 转成 ISO 字符串，供 Redis JSON 样本序列化使用。"""
     if isinstance(value, datetime):
         return value.isoformat()
     raise TypeError(f"Cannot JSON encode {value!r}")
 
 
 def _restore_datetimes(row: dict[str, Any]) -> None:
+    """把 Redis 中读出的 ISO 时间字符串恢复为 datetime，便于 ILP 写入。"""
     for key in ("ts", "collected_at", "server_ts"):
         if row.get(key):
             row[key] = parse_datetime(row[key])

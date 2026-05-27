@@ -4,13 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import Settings
-from .logging import configure_logging
-from .services import MarketIngestionService
+from ..application.ingestion_service import MarketIngestionService
+from ..common.logging import configure_logging
+from ..core.config import Settings
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python main.py", description="TDX API to QuestDB ingestion")
+    """构建本地运维和 Prefect worker 可共用的命令行参数解析器。"""
+    parser = argparse.ArgumentParser(prog="quant-ripper", description="TDX API to QuestDB ingestion")
     parser.add_argument("--env-file", default=None, help="Path to .env file")
     parser.add_argument("--log-level", default="INFO")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """执行指定采集命令，并以 JSON 输出结果，方便脚本和调度系统解析。"""
     args = build_parser().parse_args()
     configure_logging(args.log_level)
     settings = Settings.from_env(args.env_file)
@@ -97,4 +99,5 @@ def main() -> None:
 
 
 def _codes(value: str) -> list[str]:
+    """解析逗号分隔证券代码，自动去掉空白和空项。"""
     return [item.strip() for item in value.split(",") if item.strip()]

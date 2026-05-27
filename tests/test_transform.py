@@ -4,7 +4,7 @@ import _path  # noqa: F401
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from quant_ripper.transform import normalize_quote, orderbook_feature
+from quant_ripper.domain.transforms import normalize_quote, orderbook_feature
 
 
 class TransformTests(unittest.TestCase):

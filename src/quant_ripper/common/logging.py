@@ -8,7 +8,10 @@ from typing import Any
 
 
 class JsonFormatter(logging.Formatter):
+    """把日志记录格式化为紧凑 JSON，方便 Prefect 与日志系统采集。"""
+
     def format(self, record: logging.LogRecord) -> str:
+        """序列化单条日志，并保留 `extra` 传入的结构化字段。"""
         payload: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(record.created)),
             "level": record.levelname,
@@ -55,6 +58,7 @@ _RESERVED = {
 
 
 def configure_logging(level: str = "INFO") -> None:
+    """为 CLI、Prefect task 和本地 worker 配置统一的 JSON stdout 日志。"""
     root = logging.getLogger()
     root.handlers.clear()
     handler = logging.StreamHandler(sys.stdout)

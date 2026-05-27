@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
+    """读取简单 KEY=VALUE 配置文件；不依赖 python-dotenv，便于轻量部署。"""
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -22,6 +23,7 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 
 def _merged_env(env_file: str | None = None) -> dict[str, str]:
+    """按示例配置、指定 env 文件、进程环境变量的优先级合并运行配置。"""
     defaults = _read_env_file(PROJECT_ROOT / "config" / "example.env")
     selected = PROJECT_ROOT / ".env"
     if env_file:
@@ -32,16 +34,19 @@ def _merged_env(env_file: str | None = None) -> dict[str, str]:
 
 
 def _get_int(env: dict[str, str], key: str, default: int) -> int:
+    """读取整数配置；缺失或空字符串时使用默认值。"""
     value = env.get(key)
     return int(value) if value not in (None, "") else default
 
 
 def _get_float(env: dict[str, str], key: str, default: float) -> float:
+    """读取浮点数配置；缺失或空字符串时使用默认值。"""
     value = env.get(key)
     return float(value) if value not in (None, "") else default
 
 
 def _get_bool(env: dict[str, str], key: str, default: bool) -> bool:
+    """读取布尔配置；支持 1/true/yes/y/on 等常见真值写法。"""
     value = env.get(key)
     if value in (None, ""):
         return default
@@ -50,6 +55,8 @@ def _get_bool(env: dict[str, str], key: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
+    """项目运行配置，集中描述 TDX、Redis、QuestDB、HTTP 重试和业务单位口径。"""
+
     tdx_api_base_url: str
     redis_host: str
     redis_port: int
@@ -65,6 +72,8 @@ class Settings:
     questdb_pg_password: str
     questdb_ilp_host: str
     questdb_ilp_port: int
+    questdb_ilp_protocol: str
+    questdb_ilp_conf: str | None
     questdb_health_url: str
     http_timeout_seconds: float
     http_retries: int
@@ -75,6 +84,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Settings":
+        """从 `config/example.env`、`.env` 和进程环境构建不可变运行配置。"""
         env = _merged_env(env_file)
         return cls(
             tdx_api_base_url=env.get("TDX_API_BASE_URL", "http://192.168.31.236:9999").rstrip("/"),
@@ -92,6 +102,8 @@ class Settings:
             questdb_pg_password=env.get("QUESTDB_PG_PASSWORD", "quest"),
             questdb_ilp_host=env.get("QUESTDB_ILP_HOST", "localhost"),
             questdb_ilp_port=_get_int(env, "QUESTDB_ILP_PORT", 9009),
+            questdb_ilp_protocol=env.get("QUESTDB_ILP_PROTOCOL", "tcp"),
+            questdb_ilp_conf=env.get("QUESTDB_ILP_CONF") or None,
             questdb_health_url=env.get("QUESTDB_HEALTH_URL", "http://localhost:9003").rstrip("/"),
             http_timeout_seconds=_get_float(env, "HTTP_TIMEOUT_SECONDS", 10.0),
             http_retries=_get_int(env, "HTTP_RETRIES", 3),

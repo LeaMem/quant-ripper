@@ -3,7 +3,7 @@ from __future__ import annotations
 import _path  # noqa: F401
 import unittest
 
-from quant_ripper.questdb import split_sql
+from quant_ripper.infrastructure.questdb_client import split_sql
 
 
 class QuestDbTests(unittest.TestCase):

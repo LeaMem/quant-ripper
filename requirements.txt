@@ -1,3 +1,4 @@
-httpx>=0.27
-questdb>=2.0.0
+httpx>=0.28
+questdb>=4.1.0
 psycopg[binary]>=3.2
+redis>=5.0
